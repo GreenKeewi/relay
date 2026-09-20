@@ -513,73 +513,81 @@ export default function RelayApp() {
                   <div className="filter-group-separator" role="separator" aria-orientation="horizontal" />
                 </>
               )}
-              <FilterRail
-                label="Status filters"
-                options={statusFilters}
-                value={statusFilter}
-                onChange={setStatusFilter}
-                renderLeading={(filter) => (
-                  <span
-                    className="filter-status-dot"
-                    data-status={statusFilterTones[filter]}
-                    aria-hidden="true"
-                  />
-                )}
-                renderTrailing={(filter) => (
-                  <span className="filter-session-count" aria-label={`${statusCounts[filter]} sessions`}>
-                    {statusCounts[filter]}
-                  </span>
-                )}
-              />
+              <div className="status-filter-row">
+                <FilterRail
+                  label="Status filters"
+                  options={statusFilters}
+                  value={statusFilter}
+                  onChange={setStatusFilter}
+                  renderLeading={(filter) => (
+                    <span
+                      className="filter-status-dot"
+                      data-status={statusFilterTones[filter]}
+                      aria-hidden="true"
+                    />
+                  )}
+                  renderTrailing={(filter) => (
+                    <span className="filter-session-count" aria-label={`${statusCounts[filter]} sessions`}>
+                      {statusCounts[filter]}
+                    </span>
+                  )}
+                />
+                <button
+                  className="selection-mode-button"
+                  type="button"
+                  aria-label={selectionMode ? "Exit session selection" : "Select sessions"}
+                  aria-pressed={selectionMode}
+                  title={selectionMode ? "Exit selection" : "Select sessions"}
+                  onClick={toggleSelectionMode}
+                >
+                  {selectionMode
+                    ? <X aria-hidden="true" weight="bold" />
+                    : <CheckSquare aria-hidden="true" />}
+                </button>
+              </div>
             </div>
 
-            <div className="session-selection-tools" data-active={selectionMode}>
-              <button type="button" onClick={toggleSelectionMode}>
-                {selectionMode ? <X aria-hidden="true" /> : <CheckSquare aria-hidden="true" />}
-                {selectionMode ? "Cancel" : "Select"}
-              </button>
-              {selectionMode && (
-                <>
-                  <span>{selectedSessions.length} selected</span>
-                  <button type="button" onClick={toggleAllVisible} disabled={visibleSessions.length === 0}>
-                    {visibleSessions.length > 0
-                      && visibleSessions.every((session) => selectedSessionIds.has(session.id))
-                      ? "Clear"
-                      : "All"}
-                  </button>
-                  <select
-                    aria-label="Move selected sessions to status"
-                    value=""
-                    disabled={selectedSessions.length === 0}
-                    onChange={(event) => {
-                      if (event.target.value) moveSelectedSessions(event.target.value as ManagedStatus);
-                    }}
-                  >
-                    <option value="">Move...</option>
-                    <option value="working">In progress</option>
-                    <option value="to_review">To review</option>
-                    <option value="done">Done</option>
-                  </select>
-                  <button
-                    type="button"
-                    disabled={selectedSessions.length === 0}
-                    onClick={archiveSelectedSessions}
-                  >
-                    <Archive aria-hidden="true" />
-                    {statusFilter === "Archived" ? "Restore" : "Archive"}
-                  </button>
-                  <button
-                    className="session-delete-action"
-                    type="button"
-                    disabled={selectedSessions.length === 0}
-                    onClick={deleteSelectedSessions}
-                  >
-                    <Trash aria-hidden="true" />
-                    Delete
-                  </button>
-                </>
-              )}
-            </div>
+            {selectionMode && (
+              <div className="session-selection-tools">
+                <span>{selectedSessions.length} selected</span>
+                <button type="button" onClick={toggleAllVisible} disabled={visibleSessions.length === 0}>
+                  {visibleSessions.length > 0
+                    && visibleSessions.every((session) => selectedSessionIds.has(session.id))
+                    ? "Clear"
+                    : "All"}
+                </button>
+                <select
+                  aria-label="Move selected sessions to status"
+                  value=""
+                  disabled={selectedSessions.length === 0}
+                  onChange={(event) => {
+                    if (event.target.value) moveSelectedSessions(event.target.value as ManagedStatus);
+                  }}
+                >
+                  <option value="">Move...</option>
+                  <option value="working">In progress</option>
+                  <option value="to_review">To review</option>
+                  <option value="done">Done</option>
+                </select>
+                <button
+                  type="button"
+                  disabled={selectedSessions.length === 0}
+                  onClick={archiveSelectedSessions}
+                >
+                  <Archive aria-hidden="true" />
+                  {statusFilter === "Archived" ? "Restore" : "Archive"}
+                </button>
+                <button
+                  className="session-delete-action"
+                  type="button"
+                  disabled={selectedSessions.length === 0}
+                  onClick={deleteSelectedSessions}
+                >
+                  <Trash aria-hidden="true" />
+                  Delete
+                </button>
+              </div>
+            )}
 
             <div className="claude-session-scroll">
               {isDetecting && discovery === null ? (
