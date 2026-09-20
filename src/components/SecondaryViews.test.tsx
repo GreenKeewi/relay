@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ClaudeUsage } from "../claude";
-import { describeRefreshImpact, UsageView } from "./SecondaryViews";
+import { describeRefreshImpact, SettingsView, UsageView } from "./SecondaryViews";
 
 const baseUsage: ClaudeUsage = {
   source: "claude-statusline",
@@ -140,5 +140,72 @@ describe("refresh impact guidance", () => {
     expect(describeRefreshImpact(5_000, 16, 3, 16).tone).toBe("active");
     expect(describeRefreshImpact(30_000, 4, 30, 4).tone).toBe("quiet");
     expect(describeRefreshImpact(60_000, 2, 50, 2).tone).toBe("quiet");
+  });
+});
+
+describe("SettingsView refresh picker", () => {
+  afterEach(cleanup);
+
+  const settingsProps = {
+    sessionCount: 8,
+    cliAvailable: true,
+    configDir: "C:/Users/relay/.claude/projects",
+    isRefreshing: false,
+    refreshIntervalMs: 30_000 as const,
+    logicalProcessorCount: 12,
+    deviceMemoryGb: 16,
+    onRefresh: vi.fn(),
+    onRefreshIntervalChange: vi.fn(),
+    onDisconnect: vi.fn(),
+  };
+
+  it("renders a themed listbox and applies a selected refresh rate", () => {
+    const onRefreshIntervalChange = vi.fn();
+    render(
+      <SettingsView
+        {...settingsProps}
+        onRefreshIntervalChange={onRefreshIntervalChange}
+      />,
+    );
+
+    const trigger = screen.getByRole("button", { name: "Session refresh interval: 30 sec" });
+    expect(trigger).toHaveAttribute("aria-expanded", "false");
+
+    fireEvent.click(trigger);
+    expect(trigger).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("listbox", { name: "Refresh rate" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: /30 sec Recommended/ })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+
+    fireEvent.click(screen.getByRole("option", { name: /5 sec Fastest/ }));
+    expect(onRefreshIntervalChange).toHaveBeenCalledWith(5_000);
+    expect(screen.queryByRole("listbox", { name: "Refresh rate" })).not.toBeInTheDocument();
+    expect(trigger).toHaveFocus();
+  });
+
+  it("supports arrow navigation and Escape without changing the value", () => {
+    const onRefreshIntervalChange = vi.fn();
+    render(
+      <SettingsView
+        {...settingsProps}
+        onRefreshIntervalChange={onRefreshIntervalChange}
+      />,
+    );
+
+    const trigger = screen.getByRole("button", { name: "Session refresh interval: 30 sec" });
+    trigger.focus();
+    fireEvent.keyDown(trigger, { key: "ArrowDown" });
+
+    const selected = screen.getByRole("option", { name: /30 sec Recommended/ });
+    expect(selected).toHaveFocus();
+    fireEvent.keyDown(selected, { key: "ArrowDown" });
+    expect(screen.getByRole("option", { name: /1 min Lightest/ })).toHaveFocus();
+
+    fireEvent.keyDown(screen.getByRole("option", { name: /1 min Lightest/ }), { key: "Escape" });
+    expect(screen.queryByRole("listbox", { name: "Refresh rate" })).not.toBeInTheDocument();
+    expect(trigger).toHaveFocus();
+    expect(onRefreshIntervalChange).not.toHaveBeenCalled();
   });
 });

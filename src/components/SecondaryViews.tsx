@@ -1,11 +1,13 @@
 import {
   BellSimple,
+  CaretDown,
+  Check,
   CheckCircle,
   Gauge,
   ShieldCheck,
   ToggleRight,
 } from "@phosphor-icons/react";
-import { useState } from "react";
+import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import type { ClaudeUsage, ClaudeUsageReason } from "../claude";
 import { AgentLogo } from "./AgentLogo";
 
@@ -266,12 +268,135 @@ type SettingsViewProps = {
 
 export type RefreshIntervalMs = 5_000 | 10_000 | 30_000 | 60_000;
 
-const refreshOptions: ReadonlyArray<{ value: RefreshIntervalMs; label: string }> = [
-  { value: 5_000, label: "5 sec" },
-  { value: 10_000, label: "10 sec" },
-  { value: 30_000, label: "30 sec" },
-  { value: 60_000, label: "1 min" },
+const refreshOptions: ReadonlyArray<{
+  value: RefreshIntervalMs;
+  label: string;
+  description: string;
+}> = [
+  { value: 5_000, label: "5 sec", description: "Fastest" },
+  { value: 10_000, label: "10 sec", description: "Frequent" },
+  { value: 30_000, label: "30 sec", description: "Recommended" },
+  { value: 60_000, label: "1 min", description: "Lightest" },
 ];
+
+type RefreshIntervalPickerProps = {
+  value: RefreshIntervalMs;
+  onChange: (value: RefreshIntervalMs) => void;
+  title: string;
+};
+
+function RefreshIntervalPicker({ value, onChange, title }: RefreshIntervalPickerProps) {
+  const [isOpen, setIsOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const optionRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  const pendingFocusIndex = useRef<number | null>(null);
+  const selectedIndex = refreshOptions.findIndex((option) => option.value === value);
+  const selectedOption = refreshOptions[selectedIndex] ?? refreshOptions[2];
+
+  useEffect(() => {
+    if (!isOpen) return;
+
+    const focusIndex = pendingFocusIndex.current ?? Math.max(0, selectedIndex);
+    pendingFocusIndex.current = null;
+    optionRefs.current[focusIndex]?.focus();
+
+    const closeOnOutsidePress = (event: PointerEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) setIsOpen(false);
+    };
+    document.addEventListener("pointerdown", closeOnOutsidePress);
+    return () => document.removeEventListener("pointerdown", closeOnOutsidePress);
+  }, [isOpen, selectedIndex]);
+
+  const openFromKeyboard = (event: KeyboardEvent<HTMLButtonElement>) => {
+    if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+    event.preventDefault();
+    pendingFocusIndex.current = Math.max(0, selectedIndex);
+    setIsOpen(true);
+  };
+
+  const moveOptionFocus = (event: KeyboardEvent<HTMLButtonElement>, index: number) => {
+    let nextIndex: number | null = null;
+    if (event.key === "ArrowDown") nextIndex = (index + 1) % refreshOptions.length;
+    if (event.key === "ArrowUp") nextIndex = (index - 1 + refreshOptions.length) % refreshOptions.length;
+    if (event.key === "Home") nextIndex = 0;
+    if (event.key === "End") nextIndex = refreshOptions.length - 1;
+    if (nextIndex === null) return;
+    event.preventDefault();
+    optionRefs.current[nextIndex]?.focus();
+  };
+
+  const chooseOption = (nextValue: RefreshIntervalMs) => {
+    onChange(nextValue);
+    setIsOpen(false);
+    triggerRef.current?.focus();
+  };
+
+  return (
+    <div
+      className="refresh-picker"
+      data-open={isOpen}
+      ref={rootRef}
+      onBlur={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setIsOpen(false);
+      }}
+      onKeyDown={(event) => {
+        if (event.key !== "Escape" || !isOpen) return;
+        event.preventDefault();
+        setIsOpen(false);
+        triggerRef.current?.focus();
+      }}
+    >
+      <button
+        className="refresh-picker-trigger"
+        type="button"
+        aria-label={`Session refresh interval: ${selectedOption.label}`}
+        aria-haspopup="listbox"
+        aria-expanded={isOpen}
+        aria-controls="refresh-interval-options"
+        title={title}
+        ref={triggerRef}
+        onClick={() => setIsOpen((current) => !current)}
+        onKeyDown={openFromKeyboard}
+      >
+        <span>{selectedOption.label}</span>
+        <CaretDown aria-hidden="true" weight="bold" />
+      </button>
+
+      {isOpen && (
+        <div
+          className="refresh-picker-menu"
+          id="refresh-interval-options"
+          role="listbox"
+          aria-label="Refresh rate"
+        >
+          {refreshOptions.map((option, index) => {
+            const isSelected = option.value === value;
+            return (
+              <button
+                className="refresh-picker-option"
+                type="button"
+                role="option"
+                aria-selected={isSelected}
+                key={option.value}
+                ref={(element) => { optionRefs.current[index] = element; }}
+                tabIndex={isSelected ? 0 : -1}
+                onClick={() => chooseOption(option.value)}
+                onKeyDown={(event) => moveOptionFocus(event, index)}
+              >
+                <span>
+                  <strong>{option.label}</strong>
+                  <small>{option.description}</small>
+                </span>
+                <Check aria-hidden="true" weight="bold" />
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
 
 export function describeRefreshImpact(
   intervalMs: RefreshIntervalMs,
@@ -383,16 +508,11 @@ export function SettingsView({
             <strong>Refresh rate</strong>
             <small data-tone={refreshImpact.tone}>{refreshImpact.text}</small>
           </span>
-          <select
-            aria-label="Session refresh interval"
+          <RefreshIntervalPicker
             value={refreshIntervalMs}
-            onChange={(event) => onRefreshIntervalChange(Number(event.target.value) as RefreshIntervalMs)}
+            onChange={onRefreshIntervalChange}
             title={`Estimate based on ${logicalProcessorCount} logical processors and ${sessionCount} watched sessions`}
-          >
-            {refreshOptions.map((option) => (
-              <option value={option.value} key={option.value}>{option.label}</option>
-            ))}
-          </select>
+          />
         </div>
         <button type="button" disabled={isRefreshing} onClick={() => void onRefresh()}>
           <Gauge aria-hidden="true" />
