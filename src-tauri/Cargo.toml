@@ -1,0 +1,22 @@
+[package]
+name = "relay"
+version = "0.1.0"
+description = "Relay desktop shell"
+authors = ["Relay"]
+edition = "2021"
+
+[lib]
+name = "relay_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+time = { version = "0.3", features = ["parsing"] }
+tokio = { version = "1", features = ["time"] }
+url = "2"
