@@ -6,22 +6,34 @@ function prefersReducedMotion() {
   return window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 }
 
-export type DockEdge = "left" | "right";
+export type DockEdge = "top" | "right" | "bottom" | "left";
 
-type DockPlacement = {
+export type DockPlacement = {
   edge: DockEdge;
   x: number;
   y: number;
 };
 
-export async function snapDockToNearestEdge() {
-  const placement = await invoke<DockPlacement>("snap_dock_to_nearest_edge");
-  return placement.edge;
+export function snapDockToNearestEdge() {
+  return invoke<DockPlacement>("snap_dock_to_nearest_edge");
 }
 
 export async function dragDockToNearestEdge() {
+  await invoke("prepare_dock_drag");
   await getCurrentWindow().startDragging();
   return snapDockToNearestEdge();
+}
+
+export function openDockMenu() {
+  return invoke<DockPlacement>("open_dock_menu");
+}
+
+export function closeDockMenu() {
+  return invoke<DockPlacement>("close_dock_menu");
+}
+
+export function hideDockFor(durationSeconds: 3_600 | 86_400) {
+  return invoke("hide_dock_for", { durationSeconds });
 }
 
 export function invokeWindowCommand(

@@ -20,6 +20,11 @@
   --radius-panel: 20px;
   --radius-control: 11px;
   --radius-pill: 999px;
+  --dropdown-open-dur: 250ms;
+  --dropdown-close-dur: 150ms;
+  --dropdown-pre-scale: 0.97;
+  --dropdown-closing-scale: 0.99;
+  --dropdown-ease: cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 * {
@@ -463,29 +468,29 @@ button:focus-visible {
   background: var(--text-muted);
 }
 
-.filter-status-dot[data-status="all"] {
-  background: var(--text-soft);
-  box-shadow: 0 0 6px color-mix(in srgb, var(--text-soft) 55%, transparent);
+.filter-status-dot[data-status="neutral"] {
+  background: var(--text-muted);
+  box-shadow: none;
 }
 
-.filter-status-dot[data-status="working"] {
-  background: var(--done);
-  box-shadow: 0 0 7px color-mix(in srgb, var(--done) 82%, transparent);
+.filter-status-dot[data-status="blue"] {
+  background: #6ea8fe;
+  box-shadow: 0 0 7px color-mix(in srgb, #6ea8fe 82%, transparent);
 }
 
-.filter-status-dot[data-status="to_review"] {
+.filter-status-dot[data-status="amber"] {
   background: var(--review);
   box-shadow: 0 0 7px color-mix(in srgb, var(--review) 82%, transparent);
 }
 
-.filter-status-dot[data-status="done"] {
-  background: var(--accent);
-  box-shadow: 0 0 6px color-mix(in srgb, var(--accent) 75%, transparent);
+.filter-status-dot[data-status="green"] {
+  background: var(--done);
+  box-shadow: 0 0 6px color-mix(in srgb, var(--done) 75%, transparent);
 }
 
-.filter-status-dot[data-status="archived"] {
+.filter-status-dot[data-status="muted"] {
   background: var(--text-muted);
-  box-shadow: 0 0 5px color-mix(in srgb, var(--text-muted) 45%, transparent);
+  box-shadow: none;
 }
 
 .filter-session-count {
@@ -1299,26 +1304,95 @@ button:focus-visible {
   display: grid;
   place-items: center;
   width: 100%;
-  min-height: 100dvh;
+  height: 100dvh;
+  min-height: 0;
+  padding: 3px;
   overflow: hidden;
   border: 1px solid var(--line);
-  border-radius: 24px;
+  border-radius: 999px;
   background: rgba(14, 15, 18, 0.95);
   backdrop-filter: blur(10px) saturate(108%);
   -webkit-backdrop-filter: blur(10px) saturate(108%);
   cursor: grab;
   user-select: none;
   touch-action: none;
+  transition: border-radius 140ms cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 .dock-view[data-edge="right"] {
   border-right: 0;
-  border-radius: 24px 0 0 24px;
+  border-radius: 999px 0 0 999px;
 }
 
 .dock-view[data-edge="left"] {
   border-left: 0;
-  border-radius: 0 24px 24px 0;
+  border-radius: 0 999px 999px 0;
+}
+
+.dock-view[data-edge="top"] {
+  border-top: 0;
+  border-radius: 0 0 999px 999px;
+}
+
+.dock-view[data-edge="bottom"] {
+  border-bottom: 0;
+  border-radius: 999px 999px 0 0;
+}
+
+.dock-view[data-dragging="true"] {
+  border: 1px solid var(--line);
+  border-radius: 50%;
+}
+
+.dock-view[data-menu-open="true"] {
+  gap: 5px;
+  padding: 6px;
+  background: rgba(14, 15, 18, 0.98);
+}
+
+.dock-view[data-menu-open="true"][data-edge="left"] {
+  grid-template-columns: 48px minmax(0, 1fr);
+  border-radius: 0 18px 18px 0;
+}
+
+.dock-view[data-menu-open="true"][data-edge="right"] {
+  grid-template-columns: minmax(0, 1fr) 48px;
+  border-radius: 18px 0 0 18px;
+}
+
+.dock-view[data-menu-open="true"][data-edge="top"] {
+  grid-template-rows: 48px minmax(0, 1fr);
+  border-radius: 0 0 18px 18px;
+}
+
+.dock-view[data-menu-open="true"][data-edge="bottom"] {
+  grid-template-rows: minmax(0, 1fr) 48px;
+  border-radius: 18px 18px 0 0;
+}
+
+.dock-view[data-menu-open="true"][data-edge="right"] .dock-ring {
+  grid-column: 2;
+}
+
+.dock-view[data-menu-open="true"][data-edge="bottom"] .dock-ring {
+  grid-row: 2;
+}
+
+.dock-view[data-menu-open="true"][data-edge="left"] .dock-quick-menu {
+  grid-column: 2;
+}
+
+.dock-view[data-menu-open="true"][data-edge="right"] .dock-quick-menu {
+  grid-column: 1;
+  grid-row: 1;
+}
+
+.dock-view[data-menu-open="true"][data-edge="top"] .dock-quick-menu {
+  grid-row: 2;
+}
+
+.dock-view[data-menu-open="true"][data-edge="bottom"] .dock-quick-menu {
+  grid-row: 1;
 }
 
 .dock-view:active,
@@ -1330,7 +1404,7 @@ button:focus-visible {
   position: relative;
   display: grid;
   place-items: center;
-  width: min(46px, calc(100vmin - 4px));
+  width: min(48px, calc(100vmin - 6px));
   aspect-ratio: 1;
   padding: 0;
   border: 0;
@@ -1403,6 +1477,73 @@ button:focus-visible {
   line-height: 1;
 }
 
+.t-dropdown {
+  transform-origin: top left;
+  transform: scale(var(--dropdown-pre-scale));
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    transform var(--dropdown-open-dur) var(--dropdown-ease),
+    opacity   var(--dropdown-open-dur) var(--dropdown-ease);
+  will-change: transform, opacity;
+}
+.t-dropdown[data-origin="top-right"]     { transform-origin: top right; }
+.t-dropdown[data-origin="top-center"]    { transform-origin: top center; }
+.t-dropdown[data-origin="bottom-left"]   { transform-origin: bottom left; }
+.t-dropdown[data-origin="bottom-center"] { transform-origin: bottom center; }
+.t-dropdown[data-origin="bottom-right"]  { transform-origin: bottom right; }
+
+.t-dropdown.is-open {
+  transform: scale(1);
+  opacity: 1;
+  pointer-events: auto;
+}
+.t-dropdown.is-closing {
+  transform: scale(var(--dropdown-closing-scale));
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    transform var(--dropdown-close-dur) var(--dropdown-ease),
+    opacity   var(--dropdown-close-dur) var(--dropdown-ease);
+}
+
+.dock-quick-menu {
+  display: grid;
+  align-self: center;
+  width: 100%;
+  gap: 2px;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(3, 4, 6, 0.5);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.045);
+}
+
+.dock-quick-menu button {
+  min-height: 31px;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 8px;
+  color: var(--text-soft);
+  background: transparent;
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 650;
+  line-height: 1.1;
+  text-align: left;
+  transition: color 140ms ease, background-color 140ms ease, transform 100ms ease;
+}
+
+.dock-quick-menu button:hover,
+.dock-quick-menu button:focus-visible {
+  color: var(--text);
+  background: var(--surface-hover);
+}
+
+.dock-quick-menu button:active {
+  transform: scale(0.98);
+}
+
 @keyframes content-in {
   from {
     opacity: 0;
@@ -1451,6 +1592,7 @@ button:focus-visible {
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .t-dropdown { transition: none !important; }
   *,
   *::before,
   *::after {

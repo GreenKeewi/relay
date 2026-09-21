@@ -51,12 +51,12 @@ const tabs = [
 ] as const;
 
 const statusFilters = ["All", "In progress", "To review", "Done", "Archived"] as const;
-const statusFilterTones: Record<ClaudeStatusFilter, string> = {
-  All: "all",
-  "In progress": "working",
-  "To review": "to_review",
-  Done: "done",
-  Archived: "archived",
+export const statusFilterTones: Record<ClaudeStatusFilter, string> = {
+  All: "neutral",
+  "In progress": "blue",
+  "To review": "amber",
+  Done: "green",
+  Archived: "muted",
 };
 const ONBOARDING_KEY = "relay:claude-onboarded";
 const REVIEW_BASELINE_KEY = "relay:review-baseline-v1";

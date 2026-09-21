@@ -1,8 +1,10 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
+    fs::{self, File, OpenOptions},
+    io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -18,11 +20,22 @@ mod claude;
 
 const WIDGET_WIDTH: f64 = 380.0;
 const WIDGET_HEIGHT: f64 = 700.0;
-const DOCK_WIDTH: f64 = 52.0;
-const DOCK_HEIGHT: f64 = 96.0;
+const WIDGET_MIN_WIDTH: f64 = 320.0;
+const WIDGET_MIN_HEIGHT: f64 = 520.0;
+const WIDGET_MAX_WIDTH: f64 = 720.0;
+const WIDGET_MAX_HEIGHT: f64 = 1_000.0;
+const DOCK_WALL_THICKNESS: f64 = 52.0;
+const DOCK_WALL_LENGTH: f64 = 58.0;
+const DOCK_DRAG_SIZE: f64 = 58.0;
+const DOCK_MENU_WIDTH: f64 = 190.0;
+const DOCK_MENU_HEIGHT: f64 = 166.0;
+const WINDOW_GEOMETRY_VERSION: u8 = 1;
+const MAX_WINDOW_GEOMETRY_BYTES: usize = 16 * 1024;
+const WINDOW_GEOMETRY_FILE: &str = "window-geometry.json";
 const EDGE_GAP: f64 = 0.0;
 const FRAME_TIME: Duration = Duration::from_millis(16);
 const PHASE_TIME: Duration = Duration::from_millis(110);
+const GEOMETRY_SETTLE_TIME: Duration = Duration::from_millis(250);
 
 const MODE_WIDGET: u8 = 0;
 const MODE_TRANSITIONING: u8 = 1;
@@ -36,12 +49,90 @@ struct WindowRect {
     height: f64,
 }
 
+#[derive(Deserialize, Serialize)]
+struct StoredWindowGeometry {
+    version: u8,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+fn drag_square_rect(current: WindowRect, scale: f64) -> WindowRect {
+    let size = DOCK_DRAG_SIZE * scale;
+    WindowRect {
+        x: current.x + (current.width - size) / 2.0,
+        y: current.y + (current.height - size) / 2.0,
+        width: size,
+        height: size,
+    }
+}
+
+fn decode_window_geometry(bytes: &[u8]) -> Option<WindowRect> {
+    if bytes.len() > MAX_WINDOW_GEOMETRY_BYTES {
+        return None;
+    }
+    let stored = serde_json::from_slice::<StoredWindowGeometry>(bytes).ok()?;
+    let values = [stored.x, stored.y, stored.width, stored.height];
+    if stored.version != WINDOW_GEOMETRY_VERSION
+        || values.iter().any(|value| !value.is_finite())
+        || stored.x.abs() > 100_000.0
+        || stored.y.abs() > 100_000.0
+        || !(WIDGET_MIN_WIDTH..=4_096.0).contains(&stored.width)
+        || !(400.0..=4_096.0).contains(&stored.height)
+    {
+        return None;
+    }
+    Some(WindowRect {
+        x: stored.x,
+        y: stored.y,
+        width: stored.width,
+        height: stored.height,
+    })
+}
+
+fn fit_widget_rect_to_bounds(
+    rect: WindowRect,
+    monitor_left: f64,
+    monitor_top: f64,
+    monitor_width: f64,
+    monitor_height: f64,
+    scale: f64,
+) -> WindowRect {
+    let width = rect
+        .width
+        .clamp(WIDGET_MIN_WIDTH * scale, WIDGET_MAX_WIDTH * scale)
+        .min(monitor_width);
+    let height = rect
+        .height
+        .clamp(WIDGET_MIN_HEIGHT * scale, WIDGET_MAX_HEIGHT * scale)
+        .min(monitor_height);
+    WindowRect {
+        x: rect.x.clamp(
+            monitor_left,
+            (monitor_left + monitor_width - width).max(monitor_left),
+        ),
+        y: rect.y.clamp(
+            monitor_top,
+            (monitor_top + monitor_height - height).max(monitor_top),
+        ),
+        width,
+        height,
+    }
+}
+
+fn should_persist_geometry(scheduled_revision: u64, current_revision: u64, mode: u8) -> bool {
+    scheduled_revision == current_revision && mode == MODE_WIDGET
+}
+
 #[derive(Default)]
 struct TransitionState {
     active: Arc<AtomicBool>,
     mode: AtomicU8,
     expanded_rect: Mutex<Option<WindowRect>>,
     dock_rect: Mutex<Option<WindowRect>>,
+    geometry_revision: AtomicU64,
+    hidden_revision: AtomicU64,
 }
 
 struct TransitionGuard(Arc<AtomicBool>);
@@ -158,8 +249,8 @@ fn dock_rect(monitor: &Monitor) -> WindowRect {
     let scale = monitor.scale_factor();
     let position = monitor.position();
     let size = monitor.size();
-    let width = DOCK_WIDTH * scale;
-    let height = DOCK_HEIGHT * scale;
+    let width = DOCK_WALL_THICKNESS * scale;
+    let height = DOCK_WALL_LENGTH * scale;
     WindowRect {
         x: position.x as f64 + size.width as f64 - width - EDGE_GAP * scale,
         y: position.y as f64 + (size.height as f64 - height) / 2.0,
@@ -175,50 +266,195 @@ fn snap_rect_to_bounds(
     monitor_width: f64,
     monitor_height: f64,
 ) -> (WindowRect, &'static str) {
+    snap_rect_to_scaled_bounds(
+        current,
+        monitor_left,
+        monitor_top,
+        monitor_width,
+        monitor_height,
+        1.0,
+    )
+}
+
+fn snap_rect_to_scaled_bounds(
+    current: WindowRect,
+    monitor_left: f64,
+    monitor_top: f64,
+    monitor_width: f64,
+    monitor_height: f64,
+    scale: f64,
+) -> (WindowRect, &'static str) {
     let monitor_right = monitor_left + monitor_width;
     let monitor_bottom = monitor_top + monitor_height;
-    let current_center = current.x + current.width / 2.0;
-    let monitor_center = monitor_left + monitor_width / 2.0;
-    let edge = if current_center < monitor_center {
-        "left"
+    let center_x = current.x + current.width / 2.0;
+    let center_y = current.y + current.height / 2.0;
+    let distances = [
+        (center_x - monitor_left, "left"),
+        (monitor_right - center_x, "right"),
+        (center_y - monitor_top, "top"),
+        (monitor_bottom - center_y, "bottom"),
+    ];
+    let edge = distances
+        .into_iter()
+        .min_by(|left, right| left.0.total_cmp(&right.0))
+        .map(|(_, edge)| edge)
+        .unwrap_or("right");
+    let (width, height) = if matches!(edge, "left" | "right") {
+        (DOCK_WALL_THICKNESS * scale, DOCK_WALL_LENGTH * scale)
     } else {
-        "right"
+        (DOCK_WALL_LENGTH * scale, DOCK_WALL_THICKNESS * scale)
     };
-    let x = if edge == "left" {
-        monitor_left
-    } else {
-        monitor_right - current.width
+    let x = match edge {
+        "left" => monitor_left,
+        "right" => monitor_right - width,
+        _ => {
+            (center_x - width / 2.0).clamp(monitor_left, (monitor_right - width).max(monitor_left))
+        }
     };
-    let y = current.y.clamp(
-        monitor_top,
-        (monitor_bottom - current.height).max(monitor_top),
-    );
+    let y = match edge {
+        "top" => monitor_top,
+        "bottom" => monitor_bottom - height,
+        _ => {
+            (center_y - height / 2.0).clamp(monitor_top, (monitor_bottom - height).max(monitor_top))
+        }
+    };
 
-    (WindowRect { x, y, ..current }, edge)
+    (
+        WindowRect {
+            x,
+            y,
+            width,
+            height,
+        },
+        edge,
+    )
 }
 
 fn snap_rect_to_nearest_side(current: WindowRect, monitor: &Monitor) -> (WindowRect, &'static str) {
-    snap_rect_to_bounds(
+    snap_rect_to_scaled_bounds(
         current,
         monitor.position().x as f64,
         monitor.position().y as f64,
         monitor.size().width as f64,
         monitor.size().height as f64,
+        monitor.scale_factor(),
     )
+}
+
+fn dock_edge_for_bounds(
+    rect: WindowRect,
+    monitor_left: f64,
+    monitor_top: f64,
+    monitor_width: f64,
+    monitor_height: f64,
+) -> &'static str {
+    let monitor_right = monitor_left + monitor_width;
+    let monitor_bottom = monitor_top + monitor_height;
+    [
+        ((rect.x - monitor_left).abs(), "left"),
+        ((monitor_right - (rect.x + rect.width)).abs(), "right"),
+        ((rect.y - monitor_top).abs(), "top"),
+        ((monitor_bottom - (rect.y + rect.height)).abs(), "bottom"),
+    ]
+    .into_iter()
+    .min_by(|left, right| left.0.total_cmp(&right.0))
+    .map(|(_, edge)| edge)
+    .unwrap_or("right")
+}
+
+fn dock_menu_rect_for_bounds(
+    attached: WindowRect,
+    edge: &str,
+    monitor_left: f64,
+    monitor_top: f64,
+    monitor_width: f64,
+    monitor_height: f64,
+    scale: f64,
+) -> WindowRect {
+    let monitor_right = monitor_left + monitor_width;
+    let monitor_bottom = monitor_top + monitor_height;
+    let width = (DOCK_MENU_WIDTH * scale).min(monitor_width);
+    let height = (DOCK_MENU_HEIGHT * scale).min(monitor_height);
+    let center_x = attached.x + attached.width / 2.0;
+    let center_y = attached.y + attached.height / 2.0;
+    let x = match edge {
+        "left" => monitor_left,
+        "right" => monitor_right - width,
+        _ => (center_x - width / 2.0).clamp(monitor_left, monitor_right - width),
+    };
+    let y = match edge {
+        "top" => monitor_top,
+        "bottom" => monitor_bottom - height,
+        _ => (center_y - height / 2.0).clamp(monitor_top, monitor_bottom - height),
+    };
+    WindowRect {
+        x,
+        y,
+        width,
+        height,
+    }
+}
+
+fn validate_hide_duration(duration_seconds: u64) -> Result<Duration, String> {
+    match duration_seconds {
+        3_600 | 86_400 => Ok(Duration::from_secs(duration_seconds)),
+        _ => Err("unsupported dock hide duration".to_string()),
+    }
 }
 
 fn offscreen_dock_rect(target: WindowRect, monitor: &Monitor) -> WindowRect {
     let monitor_left = monitor.position().x as f64;
-    let monitor_right = monitor_left + monitor.size().width as f64;
-    let distance_to_left = (target.x - monitor_left).abs();
-    let distance_to_right = (monitor_right - (target.x + target.width)).abs();
-    let x = if distance_to_left < distance_to_right {
-        monitor_left - target.width - EDGE_GAP * monitor.scale_factor()
-    } else {
-        monitor_right + EDGE_GAP * monitor.scale_factor()
-    };
+    let monitor_top = monitor.position().y as f64;
+    offscreen_rect_for_bounds(
+        target,
+        monitor_left,
+        monitor_top,
+        monitor.size().width as f64,
+        monitor.size().height as f64,
+    )
+}
 
-    WindowRect { x, ..target }
+fn offscreen_rect_for_bounds(
+    target: WindowRect,
+    monitor_left: f64,
+    monitor_top: f64,
+    monitor_width: f64,
+    monitor_height: f64,
+) -> WindowRect {
+    let monitor_right = monitor_left + monitor_width;
+    let monitor_bottom = monitor_top + monitor_height;
+    let distances = [
+        ((target.x - monitor_left).abs(), "left"),
+        ((monitor_right - (target.x + target.width)).abs(), "right"),
+        ((target.y - monitor_top).abs(), "top"),
+        (
+            (monitor_bottom - (target.y + target.height)).abs(),
+            "bottom",
+        ),
+    ];
+    match distances
+        .into_iter()
+        .min_by(|left, right| left.0.total_cmp(&right.0))
+        .map(|(_, edge)| edge)
+        .unwrap_or("right")
+    {
+        "left" => WindowRect {
+            x: monitor_left - target.width,
+            ..target
+        },
+        "right" => WindowRect {
+            x: monitor_right,
+            ..target
+        },
+        "top" => WindowRect {
+            y: monitor_top - target.height,
+            ..target
+        },
+        _ => WindowRect {
+            y: monitor_bottom,
+            ..target
+        },
+    }
 }
 
 fn collapsed_widget_rect(expanded: WindowRect, dock: WindowRect) -> WindowRect {
@@ -247,6 +483,54 @@ fn default_widget_rect(monitor: &Monitor) -> WindowRect {
         width,
         height,
     }
+}
+
+fn window_geometry_path(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_config_dir()
+        .map(|directory| directory.join(WINDOW_GEOMETRY_FILE))
+        .map_err(|error| error.to_string())
+}
+
+fn load_window_geometry(path: &Path) -> Option<WindowRect> {
+    let file = File::open(path).ok()?;
+    let mut bytes = Vec::with_capacity(MAX_WINDOW_GEOMETRY_BYTES.min(512));
+    file.take((MAX_WINDOW_GEOMETRY_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    decode_window_geometry(&bytes)
+}
+
+fn persist_window_geometry(path: &Path, rect: WindowRect) -> Result<(), String> {
+    let stored = StoredWindowGeometry {
+        version: WINDOW_GEOMETRY_VERSION,
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+    };
+    let serialized = serde_json::to_vec(&stored).map_err(|error| error.to_string())?;
+    if serialized.len() > MAX_WINDOW_GEOMETRY_BYTES {
+        return Err("window geometry exceeded the local storage limit".to_string());
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| "window geometry path has no parent directory".to_string())?;
+    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let temporary = path.with_extension("json.tmp");
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temporary)
+        .map_err(|error| error.to_string())?;
+    file.write_all(&serialized)
+        .and_then(|_| file.sync_all())
+        .map_err(|error| error.to_string())?;
+    if path.exists() {
+        fs::remove_file(path).map_err(|error| error.to_string())?;
+    }
+    fs::rename(&temporary, path).map_err(|error| error.to_string())
 }
 
 fn relay_windows(app: &AppHandle) -> Result<(WebviewWindow, WebviewWindow), String> {
@@ -287,6 +571,9 @@ async fn collapse_to_dock(
             .expanded_rect
             .lock()
             .map_err(|_| "window state lock was poisoned".to_string())? = Some(expanded);
+        if let Ok(path) = window_geometry_path(&app) {
+            let _ = persist_window_geometry(&path, expanded);
+        }
 
         if !reduced_motion {
             animate_window(&widget, expanded, collapsed).await?;
@@ -335,11 +622,13 @@ async fn expand_from_dock(
     let result = async {
         let (widget, dock) = relay_windows(&app)?;
         let monitor = monitor_for(&dock).or_else(|_| monitor_for(&widget))?;
-        let dock_target = physical_rect(&dock)?;
-        *state
+        let dock_target = state
             .dock_rect
             .lock()
-            .map_err(|_| "window state lock was poisoned".to_string())? = Some(dock_target);
+            .map_err(|_| "window state lock was poisoned".to_string())?
+            .unwrap_or(physical_rect(&dock)?);
+        state.hidden_revision.fetch_add(1, Ordering::AcqRel);
+        set_rect(&dock, dock_target)?;
         let dock_offscreen = offscreen_dock_rect(dock_target, &monitor);
         let expanded = state
             .expanded_rect
@@ -371,6 +660,119 @@ async fn expand_from_dock(
         Ordering::Release,
     );
     result
+}
+
+#[tauri::command]
+fn prepare_dock_drag(app: AppHandle) -> Result<(), String> {
+    let (_, dock) = relay_windows(&app)?;
+    let monitor = monitor_for(&dock)?;
+    let dragging = drag_square_rect(physical_rect(&dock)?, monitor.scale_factor());
+    set_rect(&dock, dragging)
+}
+
+#[tauri::command]
+fn open_dock_menu(
+    app: AppHandle,
+    state: tauri::State<'_, TransitionState>,
+) -> Result<DockPlacement, String> {
+    let (_, dock) = relay_windows(&app)?;
+    let monitor = monitor_for(&dock)?;
+    let attached = state
+        .dock_rect
+        .lock()
+        .map_err(|_| "window state lock was poisoned".to_string())?
+        .unwrap_or(physical_rect(&dock)?);
+    let monitor_left = monitor.position().x as f64;
+    let monitor_top = monitor.position().y as f64;
+    let monitor_width = monitor.size().width as f64;
+    let monitor_height = monitor.size().height as f64;
+    let edge = dock_edge_for_bounds(
+        attached,
+        monitor_left,
+        monitor_top,
+        monitor_width,
+        monitor_height,
+    );
+    let menu = dock_menu_rect_for_bounds(
+        attached,
+        edge,
+        monitor_left,
+        monitor_top,
+        monitor_width,
+        monitor_height,
+        monitor.scale_factor(),
+    );
+    set_rect(&dock, menu)?;
+    Ok(DockPlacement {
+        edge,
+        x: menu.x.round() as i32,
+        y: menu.y.round() as i32,
+    })
+}
+
+#[tauri::command]
+fn close_dock_menu(
+    app: AppHandle,
+    state: tauri::State<'_, TransitionState>,
+) -> Result<DockPlacement, String> {
+    let (_, dock) = relay_windows(&app)?;
+    let monitor = monitor_for(&dock)?;
+    let target = state
+        .dock_rect
+        .lock()
+        .map_err(|_| "window state lock was poisoned".to_string())?
+        .unwrap_or_else(|| dock_rect(&monitor));
+    let edge = dock_edge_for_bounds(
+        target,
+        monitor.position().x as f64,
+        monitor.position().y as f64,
+        monitor.size().width as f64,
+        monitor.size().height as f64,
+    );
+    set_rect(&dock, target)?;
+    Ok(DockPlacement {
+        edge,
+        x: target.x.round() as i32,
+        y: target.y.round() as i32,
+    })
+}
+
+#[tauri::command]
+fn hide_dock_for(
+    app: AppHandle,
+    state: tauri::State<'_, TransitionState>,
+    duration_seconds: u64,
+) -> Result<(), String> {
+    let duration = validate_hide_duration(duration_seconds)?;
+    let (_, dock) = relay_windows(&app)?;
+    let monitor = monitor_for(&dock)?;
+    let target = state
+        .dock_rect
+        .lock()
+        .map_err(|_| "window state lock was poisoned".to_string())?
+        .unwrap_or_else(|| dock_rect(&monitor));
+    set_rect(&dock, target)?;
+    dock.hide().map_err(|error| error.to_string())?;
+    let revision = state.hidden_revision.fetch_add(1, Ordering::AcqRel) + 1;
+    let app_for_timer = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(duration).await;
+        let settled_state = app_for_timer.state::<TransitionState>();
+        if settled_state.hidden_revision.load(Ordering::Acquire) != revision
+            || settled_state.mode.load(Ordering::Acquire) != MODE_DOCK
+        {
+            return;
+        }
+        let Ok((_, settled_dock)) = relay_windows(&app_for_timer) else {
+            return;
+        };
+        let target = settled_state.dock_rect.lock().ok().and_then(|rect| *rect);
+        if let Some(target) = target {
+            let _ = set_rect(&settled_dock, target);
+        }
+        let _ = settled_dock.show();
+    });
+    Ok(())
 }
 
 #[tauri::command]
@@ -509,25 +911,96 @@ fn get_window_mode(
 fn position_initial_windows(app: &AppHandle) -> Result<(), String> {
     let (widget, dock) = relay_windows(app)?;
     let monitor = monitor_for(&widget)?;
-    let widget_rect = default_widget_rect(&monitor);
+    let monitor_position = monitor.position();
+    let monitor_size = monitor.size();
+    let geometry_path = window_geometry_path(app).ok();
+    let widget_rect = geometry_path
+        .as_deref()
+        .and_then(load_window_geometry)
+        .map(|saved| {
+            fit_widget_rect_to_bounds(
+                saved,
+                monitor_position.x as f64,
+                monitor_position.y as f64,
+                monitor_size.width as f64,
+                monitor_size.height as f64,
+                monitor.scale_factor(),
+            )
+        })
+        .unwrap_or_else(|| default_widget_rect(&monitor));
     let dock_target = dock_rect(&monitor);
 
     widget
-        .set_size(Size::Logical(LogicalSize::new(WIDGET_WIDTH, WIDGET_HEIGHT)))
+        .set_resizable(true)
         .map_err(|error| error.to_string())?;
     widget
-        .set_position(Position::Physical(PhysicalPosition::new(
-            widget_rect.x.round() as i32,
-            widget_rect.y.round() as i32,
-        )))
+        .set_min_size(Some(Size::Logical(LogicalSize::new(
+            WIDGET_MIN_WIDTH,
+            WIDGET_MIN_HEIGHT,
+        ))))
         .map_err(|error| error.to_string())?;
-    dock.set_size(Size::Logical(LogicalSize::new(DOCK_WIDTH, DOCK_HEIGHT)))
+    widget
+        .set_max_size(Some(Size::Logical(LogicalSize::new(
+            WIDGET_MAX_WIDTH,
+            WIDGET_MAX_HEIGHT,
+        ))))
         .map_err(|error| error.to_string())?;
-    dock.set_position(Position::Physical(PhysicalPosition::new(
-        dock_target.x.round() as i32,
-        dock_target.y.round() as i32,
-    )))
-    .map_err(|error| error.to_string())?;
+    set_rect(&widget, widget_rect)?;
+    set_rect(&dock, dock_target)?;
+
+    *app.state::<TransitionState>()
+        .expanded_rect
+        .lock()
+        .map_err(|_| "window state lock was poisoned".to_string())? = Some(widget_rect);
+    *app.state::<TransitionState>()
+        .dock_rect
+        .lock()
+        .map_err(|_| "window state lock was poisoned".to_string())? = Some(dock_target);
+
+    let widget_for_events = widget.clone();
+    let app_for_events = app.clone();
+    widget.on_window_event(move |event| {
+        if !matches!(
+            event,
+            tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_)
+        ) {
+            return;
+        }
+        let state = app_for_events.state::<TransitionState>();
+        if state.mode.load(Ordering::Acquire) != MODE_WIDGET {
+            return;
+        }
+        let Ok(rect) = physical_rect(&widget_for_events) else {
+            return;
+        };
+        if let Ok(mut expanded) = state.expanded_rect.lock() {
+            *expanded = Some(rect);
+        }
+        let revision = state.geometry_revision.fetch_add(1, Ordering::AcqRel) + 1;
+        let settled_widget = widget_for_events.clone();
+        let settled_app = app_for_events.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(GEOMETRY_SETTLE_TIME).await;
+            let settled_state = settled_app.state::<TransitionState>();
+            if !should_persist_geometry(
+                revision,
+                settled_state.geometry_revision.load(Ordering::Acquire),
+                settled_state.mode.load(Ordering::Acquire),
+            ) {
+                return;
+            }
+            let Ok(settled_rect) = physical_rect(&settled_widget) else {
+                return;
+            };
+            if let Ok(path) = window_geometry_path(&settled_app) {
+                let _ = persist_window_geometry(&path, settled_rect);
+            }
+        });
+    });
+
+    if let Some(path) = geometry_path {
+        let _ = persist_window_geometry(&path, widget_rect);
+    }
     Ok(())
 }
 
@@ -543,6 +1016,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             collapse_to_dock,
             expand_from_dock,
+            prepare_dock_drag,
+            open_dock_menu,
+            close_dock_menu,
+            hide_dock_for,
             snap_dock_to_nearest_edge,
             open_session,
             discover_claude_sessions,
@@ -559,7 +1036,11 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        ease_out_cubic, snap_rect_to_bounds, validate_directory, validate_source, WindowRect,
+        decode_window_geometry, dock_menu_rect_for_bounds, drag_square_rect, ease_out_cubic,
+        fit_widget_rect_to_bounds, offscreen_rect_for_bounds, should_persist_geometry,
+        snap_rect_to_bounds, snap_rect_to_scaled_bounds, validate_directory,
+        validate_hide_duration, validate_source, WindowRect, MODE_DOCK, MODE_TRANSITIONING,
+        MODE_WIDGET,
     };
 
     #[test]
@@ -589,27 +1070,193 @@ mod tests {
     }
 
     #[test]
-    fn dock_snaps_to_nearest_side_and_stays_inside_monitor_height() {
+    fn dock_snaps_to_nearest_of_all_four_edges_with_edge_specific_size() {
         let left = WindowRect {
             x: 120.0,
-            y: -30.0,
-            width: 52.0,
-            height: 96.0,
+            y: 400.0,
+            width: 58.0,
+            height: 58.0,
         };
         let right = WindowRect {
-            x: 1500.0,
-            y: 1050.0,
+            x: 1800.0,
+            y: 400.0,
+            ..left
+        };
+        let top = WindowRect {
+            x: 700.0,
+            y: 20.0,
+            ..left
+        };
+        let bottom = WindowRect {
+            x: 700.0,
+            y: 1020.0,
             ..left
         };
 
         let (left_target, left_edge) = snap_rect_to_bounds(left, 0.0, 0.0, 1920.0, 1080.0);
         assert_eq!(left_edge, "left");
         assert_eq!(left_target.x, 0.0);
-        assert_eq!(left_target.y, 0.0);
+        assert_eq!((left_target.width, left_target.height), (52.0, 58.0));
 
         let (right_target, right_edge) = snap_rect_to_bounds(right, 0.0, 0.0, 1920.0, 1080.0);
         assert_eq!(right_edge, "right");
         assert_eq!(right_target.x, 1868.0);
-        assert_eq!(right_target.y, 984.0);
+        assert_eq!((right_target.width, right_target.height), (52.0, 58.0));
+
+        let (top_target, top_edge) = snap_rect_to_bounds(top, 0.0, 0.0, 1920.0, 1080.0);
+        assert_eq!(top_edge, "top");
+        assert_eq!(top_target.y, 0.0);
+        assert_eq!((top_target.width, top_target.height), (58.0, 52.0));
+
+        let (bottom_target, bottom_edge) = snap_rect_to_bounds(bottom, 0.0, 0.0, 1920.0, 1080.0);
+        assert_eq!(bottom_edge, "bottom");
+        assert_eq!(bottom_target.y, 1028.0);
+        assert_eq!((bottom_target.width, bottom_target.height), (58.0, 52.0));
+    }
+
+    #[test]
+    fn dock_handoff_exits_through_the_attached_edge() {
+        let left = WindowRect {
+            x: 0.0,
+            y: 400.0,
+            width: 52.0,
+            height: 58.0,
+        };
+        let right = WindowRect { x: 1868.0, ..left };
+        let top = WindowRect {
+            x: 700.0,
+            y: 0.0,
+            width: 58.0,
+            height: 52.0,
+        };
+        let bottom = WindowRect { y: 1028.0, ..top };
+
+        assert_eq!(
+            offscreen_rect_for_bounds(left, 0.0, 0.0, 1920.0, 1080.0).x,
+            -52.0
+        );
+        assert_eq!(
+            offscreen_rect_for_bounds(right, 0.0, 0.0, 1920.0, 1080.0).x,
+            1920.0
+        );
+        assert_eq!(
+            offscreen_rect_for_bounds(top, 0.0, 0.0, 1920.0, 1080.0).y,
+            -52.0
+        );
+        assert_eq!(
+            offscreen_rect_for_bounds(bottom, 0.0, 0.0, 1920.0, 1080.0).y,
+            1080.0
+        );
+    }
+
+    #[test]
+    fn dock_drag_uses_a_centered_square_at_monitor_scale() {
+        let attached = WindowRect {
+            x: 0.0,
+            y: 401.0,
+            width: 78.0,
+            height: 87.0,
+        };
+
+        let dragging = drag_square_rect(attached, 1.5);
+
+        assert_eq!((dragging.width, dragging.height), (87.0, 87.0));
+        assert_eq!(dragging.x, -4.5);
+        assert_eq!(dragging.y, 401.0);
+    }
+
+    #[test]
+    fn dock_dimensions_scale_once_in_physical_coordinates() {
+        let dragging = WindowRect {
+            x: 1700.0,
+            y: 500.0,
+            width: 87.0,
+            height: 87.0,
+        };
+
+        let (target, edge) = snap_rect_to_scaled_bounds(dragging, 0.0, 0.0, 1920.0, 1080.0, 1.5);
+
+        assert_eq!(edge, "right");
+        assert_eq!((target.width, target.height), (78.0, 87.0));
+        assert_eq!(target.x, 1842.0);
+    }
+
+    #[test]
+    fn persisted_widget_geometry_is_bounded_and_validated() {
+        let valid = br#"{"version":1,"x":140.0,"y":90.0,"width":420.0,"height":760.0}"#;
+        let decoded = decode_window_geometry(valid).expect("valid saved geometry");
+        assert_eq!(decoded.x, 140.0);
+        assert_eq!((decoded.width, decoded.height), (420.0, 760.0));
+
+        assert!(decode_window_geometry(
+            br#"{"version":2,"x":140.0,"y":90.0,"width":420.0,"height":760.0}"#
+        )
+        .is_none());
+        assert!(decode_window_geometry(
+            br#"{"version":1,"x":140.0,"y":90.0,"width":40.0,"height":76.0}"#
+        )
+        .is_none());
+        assert!(decode_window_geometry(&vec![b' '; 16 * 1024 + 1]).is_none());
+    }
+
+    #[test]
+    fn restored_widget_geometry_is_clamped_to_monitor_and_size_limits() {
+        let stored = WindowRect {
+            x: 1800.0,
+            y: -200.0,
+            width: 900.0,
+            height: 300.0,
+        };
+
+        let fitted = fit_widget_rect_to_bounds(stored, 0.0, 0.0, 1920.0, 1080.0, 1.0);
+
+        assert_eq!((fitted.width, fitted.height), (720.0, 520.0));
+        assert_eq!((fitted.x, fitted.y), (1200.0, 0.0));
+    }
+
+    #[test]
+    fn geometry_debounce_persists_only_the_latest_settled_widget_event() {
+        assert!(should_persist_geometry(7, 7, MODE_WIDGET));
+        assert!(!should_persist_geometry(6, 7, MODE_WIDGET));
+        assert!(!should_persist_geometry(7, 7, MODE_TRANSITIONING));
+        assert!(!should_persist_geometry(7, 7, MODE_DOCK));
+    }
+
+    #[test]
+    fn dock_menu_expands_inward_and_keeps_the_trigger_on_each_wall() {
+        let left = WindowRect {
+            x: 0.0,
+            y: 400.0,
+            width: 52.0,
+            height: 58.0,
+        };
+        let right = WindowRect { x: 1868.0, ..left };
+        let top = WindowRect {
+            x: 700.0,
+            y: 0.0,
+            width: 58.0,
+            height: 52.0,
+        };
+        let bottom = WindowRect { y: 1028.0, ..top };
+
+        let left_menu = dock_menu_rect_for_bounds(left, "left", 0.0, 0.0, 1920.0, 1080.0, 1.0);
+        let right_menu = dock_menu_rect_for_bounds(right, "right", 0.0, 0.0, 1920.0, 1080.0, 1.0);
+        let top_menu = dock_menu_rect_for_bounds(top, "top", 0.0, 0.0, 1920.0, 1080.0, 1.0);
+        let bottom_menu =
+            dock_menu_rect_for_bounds(bottom, "bottom", 0.0, 0.0, 1920.0, 1080.0, 1.0);
+
+        assert_eq!((left_menu.x, left_menu.width), (0.0, 190.0));
+        assert_eq!((right_menu.x, right_menu.width), (1730.0, 190.0));
+        assert_eq!((top_menu.y, top_menu.height), (0.0, 166.0));
+        assert_eq!((bottom_menu.y, bottom_menu.height), (914.0, 166.0));
+    }
+
+    #[test]
+    fn timed_dock_hide_accepts_only_the_exposed_quick_action_durations() {
+        assert!(validate_hide_duration(3_600).is_ok());
+        assert!(validate_hide_duration(86_400).is_ok());
+        assert!(validate_hide_duration(0).is_err());
+        assert!(validate_hide_duration(60).is_err());
+        assert!(validate_hide_duration(u64::MAX).is_err());
     }
 }
