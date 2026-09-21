@@ -651,14 +651,15 @@ fn read_claude_oauth_credentials_from(
     if !metadata.is_file() || metadata.len() > MAX_CREDENTIAL_BYTES {
         return Err(ClaudeUsageReason::CacheUnreadable);
     }
-    let raw = fs::read_to_string(credentials_path).map_err(|error| {
+    let file = File::open(credentials_path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             ClaudeUsageReason::NoCredentials
         } else {
             ClaudeUsageReason::CacheUnreadable
         }
     })?;
-    let credentials = serde_json::from_str::<ClaudeCredentialsFile>(&raw)
+    let reader = BufReader::new(file.take(MAX_CREDENTIAL_BYTES + 1));
+    let credentials = serde_json::from_reader::<_, ClaudeCredentialsFile>(reader)
         .map_err(|_| ClaudeUsageReason::ParseError)?
         .claude_ai_oauth
         .filter(|credentials| !credentials.access_token.trim().is_empty())
