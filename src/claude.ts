@@ -52,10 +52,11 @@ export type ClaudeUsageReason =
   | "api_error"
   | "parse_error"
   | "no_credentials"
+  | "authentication_expired"
   | "unknown_upstream_error";
 
 export interface ClaudeUsage {
-  source: "claude-statusline" | "ccstatusline-cache";
+  source: "claude-statusline" | "claude-account-api" | "ccstatusline-cache";
   status: "available" | "stale" | "unavailable" | "error";
   reason?: ClaudeUsageReason | null;
   sessionPercent?: number | null;
@@ -80,6 +81,10 @@ export function readClaudeUsage() {
 
 export function enableClaudeLiveUsage() {
   return invoke<void>("enable_claude_live_usage");
+}
+
+export function reauthenticateClaude() {
+  return invoke<void>("reauthenticate_claude");
 }
 
 export function openClaudeInstallGuide() {

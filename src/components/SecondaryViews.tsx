@@ -51,6 +51,7 @@ const reasonMessages: Partial<Record<ClaudeUsageReason, string>> = {
   timeout: "Usage check timed out. Retrying automatically.",
   rate_limited: "Usage check is rate limited. Retrying automatically.",
   no_credentials: "Sign in to Claude Code to read usage.",
+  authentication_expired: "Claude login expired. Sign in again, then Relay will retry.",
 };
 
 function usagePresentation(
@@ -78,19 +79,28 @@ function usagePresentation(
 
   if (usage?.status === "available") {
     const updated = formatAge(usage.ageSeconds);
-    return usage.source === "claude-statusline"
-      ? {
+    if (usage.source === "claude-statusline") {
+      return {
           status: "Current",
           tone: "current",
           note: `Status line, updated ${updated}.`,
           placeholder: "Unavailable",
-        }
-      : {
-          status: "Recent cache",
-          tone: "cached",
-          note: `ccstatusline cache, updated ${updated}.`,
-          placeholder: "Unavailable",
-        };
+      };
+    }
+    if (usage.source === "claude-account-api") {
+      return {
+        status: "Current",
+        tone: "current",
+        note: `Claude account, updated ${updated}.`,
+        placeholder: "Unavailable",
+      };
+    }
+    return {
+      status: "Recent cache",
+      tone: "cached",
+      note: `ccstatusline cache, updated ${updated}.`,
+      placeholder: "Unavailable",
+    };
   }
 
   if (usage?.status === "stale") {
@@ -129,6 +139,7 @@ type UsageViewProps = {
   loadError?: boolean;
   onEnableLiveUsage?: () => void;
   isEnablingLiveUsage?: boolean;
+  onReauthenticateClaude?: () => void;
 };
 
 function shouldOfferLiveUsage(
@@ -153,6 +164,7 @@ export function UsageView({
   loadError = false,
   onEnableLiveUsage,
   isEnablingLiveUsage = false,
+  onReauthenticateClaude,
 }: UsageViewProps) {
   const isCurrent = usage?.status === "available";
   const presentation = usagePresentation(usage, isLoading, loadError);
@@ -243,6 +255,16 @@ export function UsageView({
                   onClick={onEnableLiveUsage}
                 >
                   {isEnablingLiveUsage ? "Enabling..." : "Enable live usage"}
+                </button>
+              )}
+              {usage?.reason === "authentication_expired" && onReauthenticateClaude && (
+                <button
+                  className="usage-live-button"
+                  type="button"
+                  aria-label="Sign in to Claude Code again"
+                  onClick={onReauthenticateClaude}
+                >
+                  Sign in again
                 </button>
               )}
             </footer>

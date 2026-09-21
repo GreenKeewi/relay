@@ -59,6 +59,32 @@ describe("UsageView", () => {
     expect(screen.getByText("ccstatusline cache, updated 1m ago.")).toBeInTheDocument();
   });
 
+  it("identifies direct account usage and explains expired Claude authentication", () => {
+    const onReauthenticateClaude = vi.fn();
+    const { rerender } = render(
+      <UsageView
+        usage={{ ...baseUsage, source: "claude-account-api" }}
+      />,
+    );
+
+    expect(screen.getByText("Claude account, updated just now.")).toBeInTheDocument();
+
+    rerender(
+      <UsageView
+        usage={{
+          ...baseUsage,
+          source: "claude-account-api",
+          status: "error",
+          reason: "authentication_expired",
+        }}
+        onReauthenticateClaude={onReauthenticateClaude}
+      />,
+    );
+    expect(screen.getByText("Claude login expired. Sign in again, then Relay will retry.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Sign in to Claude Code again" }));
+    expect(onReauthenticateClaude).toHaveBeenCalledOnce();
+  });
+
   it("hides stale values while explaining their age", () => {
     render(
       <UsageView

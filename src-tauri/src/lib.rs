@@ -459,13 +459,20 @@ fn resume_claude_session(session_id: String, cwd: String) -> Result<(), String> 
 }
 
 #[tauri::command]
-fn read_claude_usage() -> claude::ClaudeUsage {
-    claude::read_claude_usage()
+async fn read_claude_usage() -> Result<claude::ClaudeUsage, String> {
+    tauri::async_runtime::spawn_blocking(claude::read_claude_usage)
+        .await
+        .map_err(|error| format!("Claude usage refresh failed: {error}"))
 }
 
 #[tauri::command]
 fn enable_claude_live_usage() -> Result<(), String> {
     claude::enable_claude_live_usage()
+}
+
+#[tauri::command]
+fn reauthenticate_claude() -> Result<(), String> {
+    claude::reauthenticate_claude()
 }
 
 #[tauri::command]
@@ -542,6 +549,7 @@ pub fn run() {
             resume_claude_session,
             read_claude_usage,
             enable_claude_live_usage,
+            reauthenticate_claude,
             get_window_mode
         ])
         .run(tauri::generate_context!())

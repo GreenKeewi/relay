@@ -7,9 +7,10 @@ use std::{
     ffi::{OsStr, OsString},
     fmt,
     fs::{self, File},
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
     process::Command,
+    sync::{Mutex, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -18,11 +19,15 @@ const SOURCE: &str = "claude-code";
 const RECENT_ACTIVITY_WINDOW: Duration = Duration::from_secs(15 * 60);
 const MAX_RECORD_BYTES: usize = 4 * 1024 * 1024;
 const LIVE_USAGE_SOURCE: &str = "claude-statusline";
+const ACCOUNT_USAGE_SOURCE: &str = "claude-account-api";
 const CCSTATUSLINE_USAGE_SOURCE: &str = "ccstatusline-cache";
+const CLAUDE_USAGE_ENDPOINT: &str = "https://api.anthropic.com/api/oauth/usage";
+const DIRECT_USAGE_RETRY_DELAY: Duration = Duration::from_secs(60);
 // Matches ccstatusline's CACHE_MAX_AGE. Older snapshots remain useful only
 // when clearly labeled stale; they must not be presented as current quota.
 const CCSTATUSLINE_CACHE_MAX_AGE: Duration = Duration::from_secs(180);
 const MAX_USAGE_CACHE_BYTES: u64 = 64 * 1024;
+const MAX_CREDENTIAL_BYTES: u64 = 1024 * 1024;
 const MAX_STATUSLINE_INPUT_BYTES: usize = 1024 * 1024;
 const DEFAULT_STATUSLINE_COMMAND: &str = "npx -y ccstatusline@latest";
 const RELAY_STATUSLINE_BRIDGE_FILENAME: &str = "statusline-bridge.cjs";
@@ -160,7 +165,7 @@ pub enum ClaudeSessionState {
 ///
 /// The cache also contains a token fingerprint used by ccstatusline for account
 /// isolation. Relay intentionally neither deserializes nor returns that field.
-#[derive(Debug, Serialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ClaudeUsage {
     pub source: &'static str,
@@ -204,6 +209,7 @@ pub enum ClaudeUsageReason {
     ApiError,
     ParseError,
     NoCredentials,
+    AuthenticationExpired,
     UnknownUpstreamError,
 }
 
@@ -348,11 +354,70 @@ struct ClaudeStatuslineRateLimitWindow {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RelayClaudeUsageSnapshot {
+    #[serde(default)]
+    source: RelayUsageSnapshotSource,
     captured_at_ms: u64,
     session_percent: Option<f64>,
     session_reset_at_ms: Option<u64>,
     weekly_percent: Option<f64>,
     weekly_reset_at_ms: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RelayUsageSnapshotSource {
+    #[default]
+    Statusline,
+    AccountApi,
+}
+
+impl RelayUsageSnapshotSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Statusline => LIVE_USAGE_SOURCE,
+            Self::AccountApi => ACCOUNT_USAGE_SOURCE,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaudeCredentialsFile {
+    claude_ai_oauth: Option<ClaudeOauthCredentials>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaudeOauthCredentials {
+    access_token: String,
+    expires_at: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeUsageApiResponse {
+    #[serde(default)]
+    five_hour: Option<ClaudeUsageApiWindow>,
+    #[serde(default)]
+    seven_day: Option<ClaudeUsageApiWindow>,
+    #[serde(default)]
+    limits: Vec<ClaudeUsageApiLimit>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeUsageApiWindow {
+    #[serde(default)]
+    utilization: Option<f64>,
+    #[serde(default)]
+    resets_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeUsageApiLimit {
+    kind: String,
+    #[serde(default)]
+    utilization: Option<f64>,
+    #[serde(default)]
+    resets_at: Option<String>,
 }
 
 struct ParsedSession {
@@ -364,6 +429,14 @@ struct ParsedSession {
     safe_activity: Option<String>,
     last_activity: SystemTime,
 }
+
+#[derive(Default)]
+struct DirectUsageRefreshState {
+    last_attempt: Option<SystemTime>,
+    last_result: Option<ClaudeUsage>,
+}
+
+static DIRECT_USAGE_REFRESH_STATE: OnceLock<Mutex<DirectUsageRefreshState>> = OnceLock::new();
 
 /// Discover Claude Code sessions from the current user's standard data folder.
 /// A missing installation is a valid empty result, not an error.
@@ -388,15 +461,43 @@ pub fn resume_claude_session(session_id: &str, cwd: &str) -> Result<(), String> 
     spawn_resume_terminal(session_id, &cwd)
 }
 
-/// Read normalized Claude plan usage written by ccstatusline.
-///
-/// This never reads Claude credentials and never makes a network request. A
-/// stale snapshot is returned as stale rather than silently treated as current.
+/// Read normalized Claude plan usage, preferring Claude's documented statusline
+/// fields and refreshing from Anthropic only when local sources are not current.
 pub fn read_claude_usage() -> ClaudeUsage {
     let cache_root = user_home_directory().join(".cache");
     let snapshot_path = cache_root.join("relay").join("claude-usage.json");
     let ccstatusline_cache_path = cache_root.join("ccstatusline").join("usage.json");
-    read_claude_usage_from_sources(&snapshot_path, &ccstatusline_cache_path, SystemTime::now())
+    let now = SystemTime::now();
+    let local = read_claude_usage_from_sources(&snapshot_path, &ccstatusline_cache_path, now);
+    if local.status == ClaudeUsageStatus::Available {
+        return local;
+    }
+
+    let refresh_state =
+        DIRECT_USAGE_REFRESH_STATE.get_or_init(|| Mutex::new(DirectUsageRefreshState::default()));
+    if let Ok(mut state) = refresh_state.lock() {
+        let retry_due = state
+            .last_attempt
+            .and_then(|attempt| now.duration_since(attempt).ok())
+            .map(|elapsed| elapsed >= DIRECT_USAGE_RETRY_DELAY)
+            .unwrap_or(true);
+        if !retry_due {
+            return state.last_result.clone().unwrap_or(local);
+        }
+        state.last_attempt = Some(now);
+    }
+
+    let credentials_path = claude_config_directory().join(".credentials.json");
+    let refreshed = fetch_claude_usage_from_endpoint(
+        &credentials_path,
+        &snapshot_path,
+        CLAUDE_USAGE_ENDPOINT,
+        now,
+    );
+    if let Ok(mut state) = refresh_state.lock() {
+        state.last_result = Some(refreshed.clone());
+    }
+    refreshed
 }
 
 /// Install Relay's local statusline bridge while preserving the user's
@@ -410,6 +511,12 @@ pub fn enable_claude_live_usage() -> Result<(), String> {
     let settings_path = claude_directory.join("settings.json");
     let bridge_directory = claude_directory.join("relay");
     install_claude_usage_bridge_in(&settings_path, &bridge_directory)
+}
+
+/// Open Claude Code's official interactive login flow in a visible terminal.
+/// Relay never reads or submits the refresh credential itself.
+pub fn reauthenticate_claude() -> Result<(), String> {
+    spawn_claude_login_terminal()
 }
 
 fn install_claude_usage_bridge_in(
@@ -523,8 +630,249 @@ fn user_home_directory() -> PathBuf {
         .unwrap_or_default()
 }
 
+fn claude_config_directory() -> PathBuf {
+    env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| user_home_directory().join(".claude"))
+}
+
+fn read_claude_oauth_credentials_from(
+    credentials_path: &Path,
+    now: SystemTime,
+) -> Result<ClaudeOauthCredentials, ClaudeUsageReason> {
+    let metadata = fs::metadata(credentials_path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            ClaudeUsageReason::NoCredentials
+        } else {
+            ClaudeUsageReason::CacheUnreadable
+        }
+    })?;
+    if !metadata.is_file() || metadata.len() > MAX_CREDENTIAL_BYTES {
+        return Err(ClaudeUsageReason::CacheUnreadable);
+    }
+    let raw = fs::read_to_string(credentials_path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            ClaudeUsageReason::NoCredentials
+        } else {
+            ClaudeUsageReason::CacheUnreadable
+        }
+    })?;
+    let credentials = serde_json::from_str::<ClaudeCredentialsFile>(&raw)
+        .map_err(|_| ClaudeUsageReason::ParseError)?
+        .claude_ai_oauth
+        .filter(|credentials| !credentials.access_token.trim().is_empty())
+        .ok_or(ClaudeUsageReason::NoCredentials)?;
+
+    if credentials.expires_at <= unix_millis(now) {
+        return Err(ClaudeUsageReason::AuthenticationExpired);
+    }
+
+    Ok(credentials)
+}
+
+fn parse_claude_usage_api_response(
+    response: &[u8],
+    captured_at: SystemTime,
+) -> Result<ClaudeUsage, ClaudeUsageReason> {
+    let parsed = serde_json::from_slice::<ClaudeUsageApiResponse>(response)
+        .map_err(|_| ClaudeUsageReason::ParseError)?;
+    let session_limit = parsed.limits.iter().find(|limit| limit.kind == "session");
+    let weekly_limit = parsed
+        .limits
+        .iter()
+        .find(|limit| limit.kind == "weekly_all");
+    let session_percent = parsed
+        .five_hour
+        .as_ref()
+        .and_then(|window| window.utilization)
+        .or_else(|| session_limit.and_then(|limit| limit.utilization))
+        .and_then(validate_usage_percent);
+    let session_reset_at_ms = parsed
+        .five_hour
+        .as_ref()
+        .and_then(|window| window.resets_at.as_deref())
+        .or_else(|| session_limit.and_then(|limit| limit.resets_at.as_deref()))
+        .and_then(parse_rfc3339_millis);
+    let weekly_percent = parsed
+        .seven_day
+        .as_ref()
+        .and_then(|window| window.utilization)
+        .or_else(|| weekly_limit.and_then(|limit| limit.utilization))
+        .and_then(validate_usage_percent);
+    let weekly_reset_at_ms = parsed
+        .seven_day
+        .as_ref()
+        .and_then(|window| window.resets_at.as_deref())
+        .or_else(|| weekly_limit.and_then(|limit| limit.resets_at.as_deref()))
+        .and_then(parse_rfc3339_millis);
+
+    if session_percent.is_none()
+        && session_reset_at_ms.is_none()
+        && weekly_percent.is_none()
+        && weekly_reset_at_ms.is_none()
+    {
+        return Err(ClaudeUsageReason::NoUsageData);
+    }
+
+    Ok(ClaudeUsage {
+        source: ACCOUNT_USAGE_SOURCE,
+        status: ClaudeUsageStatus::Available,
+        reason: None,
+        session_percent,
+        session_reset_at_ms,
+        weekly_percent,
+        weekly_reset_at_ms,
+        updated_at_ms: Some(unix_millis(captured_at)),
+        age_seconds: Some(0),
+    })
+}
+
+fn fetch_claude_usage_from_endpoint(
+    credentials_path: &Path,
+    snapshot_path: &Path,
+    endpoint: &str,
+    captured_at: SystemTime,
+) -> ClaudeUsage {
+    let credentials = match read_claude_oauth_credentials_from(credentials_path, captured_at) {
+        Ok(credentials) => credentials,
+        Err(reason) => {
+            return empty_usage_with_source(
+                ACCOUNT_USAGE_SOURCE,
+                if reason == ClaudeUsageReason::NoCredentials {
+                    ClaudeUsageStatus::Unavailable
+                } else {
+                    ClaudeUsageStatus::Error
+                },
+                reason,
+            )
+        }
+    };
+
+    let client = match reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent("Relay/0.1")
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => {
+            return empty_usage_with_source(
+                ACCOUNT_USAGE_SOURCE,
+                ClaudeUsageStatus::Error,
+                ClaudeUsageReason::ApiError,
+            )
+        }
+    };
+
+    let response = match client
+        .get(endpoint)
+        .bearer_auth(&credentials.access_token)
+        .header("anthropic-beta", "oauth-2025-04-20")
+        .send()
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return empty_usage_with_source(
+                ACCOUNT_USAGE_SOURCE,
+                ClaudeUsageStatus::Error,
+                if error.is_timeout() {
+                    ClaudeUsageReason::Timeout
+                } else {
+                    ClaudeUsageReason::ApiError
+                },
+            )
+        }
+    };
+
+    let status = response.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return empty_usage_with_source(
+            ACCOUNT_USAGE_SOURCE,
+            ClaudeUsageStatus::Error,
+            ClaudeUsageReason::AuthenticationExpired,
+        );
+    }
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return empty_usage_with_source(
+            ACCOUNT_USAGE_SOURCE,
+            ClaudeUsageStatus::Error,
+            ClaudeUsageReason::RateLimited,
+        );
+    }
+    if !status.is_success() {
+        return empty_usage_with_source(
+            ACCOUNT_USAGE_SOURCE,
+            ClaudeUsageStatus::Error,
+            ClaudeUsageReason::ApiError,
+        );
+    }
+
+    let mut response_body = Vec::new();
+    if response
+        .take(MAX_USAGE_CACHE_BYTES + 1)
+        .read_to_end(&mut response_body)
+        .is_err()
+        || response_body.len() as u64 > MAX_USAGE_CACHE_BYTES
+    {
+        return empty_usage_with_source(
+            ACCOUNT_USAGE_SOURCE,
+            ClaudeUsageStatus::Error,
+            ClaudeUsageReason::ParseError,
+        );
+    }
+
+    let usage = match parse_claude_usage_api_response(&response_body, captured_at) {
+        Ok(usage) => usage,
+        Err(reason) => {
+            return empty_usage_with_source(
+                ACCOUNT_USAGE_SOURCE,
+                if reason == ClaudeUsageReason::NoUsageData {
+                    ClaudeUsageStatus::Unavailable
+                } else {
+                    ClaudeUsageStatus::Error
+                },
+                reason,
+            )
+        }
+    };
+    let snapshot = RelayClaudeUsageSnapshot {
+        source: RelayUsageSnapshotSource::AccountApi,
+        captured_at_ms: usage
+            .updated_at_ms
+            .unwrap_or_else(|| unix_millis(captured_at)),
+        session_percent: usage.session_percent,
+        session_reset_at_ms: usage.session_reset_at_ms,
+        weekly_percent: usage.weekly_percent,
+        weekly_reset_at_ms: usage.weekly_reset_at_ms,
+    };
+    if let Ok(serialized) = serde_json::to_vec(&snapshot) {
+        if let Some(parent) = snapshot_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::write(snapshot_path, serialized);
+    }
+    usage
+}
+
 fn claude_projects_directory() -> PathBuf {
-    user_home_directory().join(".claude").join("projects")
+    claude_config_directory().join("projects")
+}
+
+#[cfg(test)]
+fn read_claude_usage_with_direct_refresh(
+    snapshot_path: &Path,
+    ccstatusline_cache_path: &Path,
+    credentials_path: &Path,
+    endpoint: &str,
+    now: SystemTime,
+) -> ClaudeUsage {
+    let local = read_claude_usage_from_sources(snapshot_path, ccstatusline_cache_path, now);
+    if local.status == ClaudeUsageStatus::Available {
+        return local;
+    }
+    fetch_claude_usage_from_endpoint(credentials_path, snapshot_path, endpoint, now)
 }
 
 fn read_claude_usage_from_sources(
@@ -669,6 +1017,7 @@ fn write_claude_usage_snapshot_from_statusline_to(
     }
 
     let snapshot = RelayClaudeUsageSnapshot {
+        source: RelayUsageSnapshotSource::Statusline,
         captured_at_ms: unix_millis(captured_at),
         session_percent,
         session_reset_at_ms,
@@ -689,6 +1038,7 @@ fn write_claude_usage_snapshot_from_statusline_to(
 }
 
 fn usage_from_live_snapshot(snapshot: RelayClaudeUsageSnapshot, now: SystemTime) -> ClaudeUsage {
+    let source = snapshot.source.as_str();
     let captured_at = UNIX_EPOCH + Duration::from_millis(snapshot.captured_at_ms);
     let age = now.duration_since(captured_at).unwrap_or_default();
     let session_percent = snapshot.session_percent.and_then(validate_usage_percent);
@@ -702,14 +1052,14 @@ fn usage_from_live_snapshot(snapshot: RelayClaudeUsageSnapshot, now: SystemTime)
         && weekly_reset_at_ms.is_none()
     {
         return empty_usage_with_source(
-            LIVE_USAGE_SOURCE,
+            source,
             ClaudeUsageStatus::Error,
             ClaudeUsageReason::InvalidCache,
         );
     }
 
     ClaudeUsage {
-        source: LIVE_USAGE_SOURCE,
+        source,
         status: if age <= CCSTATUSLINE_CACHE_MAX_AGE {
             ClaudeUsageStatus::Available
         } else {
@@ -1280,6 +1630,48 @@ fn spawn_resume_terminal(_session_id: &str, _cwd: &Path) -> Result<(), String> {
 }
 
 #[cfg(windows)]
+fn spawn_claude_login_terminal() -> Result<(), String> {
+    match Command::new("wt.exe").args(claude_login_args()).spawn() {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            use std::os::windows::process::CommandExt;
+
+            Command::new("powershell.exe")
+                .args(powershell_login_args())
+                .creation_flags(0x0000_0010) // CREATE_NEW_CONSOLE
+                .spawn()
+                .map(|_| ())
+                .map_err(|fallback| {
+                    format!("Could not open Windows Terminal ({error}) or PowerShell ({fallback})")
+                })
+        }
+        Err(error) => Err(format!("Could not open Windows Terminal: {error}")),
+    }
+}
+
+#[cfg(not(windows))]
+fn spawn_claude_login_terminal() -> Result<(), String> {
+    Err("Opening Claude Code login is currently supported on Windows only".to_string())
+}
+
+#[cfg(windows)]
+fn claude_login_args() -> Vec<OsString> {
+    let mut args = vec![OsString::from("new-tab"), OsString::from("powershell.exe")];
+    args.extend(powershell_login_args());
+    args
+}
+
+#[cfg(windows)]
+fn powershell_login_args() -> Vec<OsString> {
+    vec![
+        OsString::from("-NoLogo"),
+        OsString::from("-NoExit"),
+        OsString::from("-Command"),
+        OsString::from("& claude auth login"),
+    ]
+}
+
+#[cfg(windows)]
 fn terminal_resume_args(session_id: &str, cwd: &Path) -> Vec<OsString> {
     let mut args = vec![
         OsString::from("new-tab"),
@@ -1305,16 +1697,23 @@ fn powershell_resume_args(session_id: &str) -> Vec<OsString> {
 #[cfg(test)]
 mod tests {
     use super::{
-        discover_claude_sessions_in, install_claude_usage_bridge_in, read_claude_usage_from,
-        read_claude_usage_from_sources, validate_session_id, validate_working_directory,
-        write_claude_usage_snapshot_from_statusline_to, ClaudeSessionState, ClaudeUsageReason,
-        ClaudeUsageStatus, RelayStatuslineBridgeConfig, RELAY_STATUSLINE_BACKUP_FILENAME,
-        RELAY_STATUSLINE_BRIDGE_FILENAME, RELAY_STATUSLINE_CONFIG_FILENAME, SOURCE,
+        claude_login_args, discover_claude_sessions_in, fetch_claude_usage_from_endpoint,
+        install_claude_usage_bridge_in, parse_claude_usage_api_response,
+        read_claude_oauth_credentials_from, read_claude_usage_from, read_claude_usage_from_sources,
+        read_claude_usage_with_direct_refresh, read_live_usage_snapshot_from, validate_session_id,
+        validate_working_directory, write_claude_usage_snapshot_from_statusline_to,
+        ClaudeSessionState, ClaudeUsageReason, ClaudeUsageStatus, RelayStatuslineBridgeConfig,
+        RELAY_STATUSLINE_BACKUP_FILENAME, RELAY_STATUSLINE_BRIDGE_FILENAME,
+        RELAY_STATUSLINE_CONFIG_FILENAME, SOURCE,
     };
     use std::{
+        ffi::OsString,
         fs,
+        io::{Read, Write},
+        net::TcpListener,
         path::{Path, PathBuf},
         sync::atomic::{AtomicU64, Ordering},
+        thread,
         time::{Duration, UNIX_EPOCH},
     };
 
@@ -1346,6 +1745,36 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    fn one_request_server(status: &str, body: &str) -> (String, thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("local test server");
+        let address = listener.local_addr().expect("server address");
+        let status = status.to_string();
+        let body = body.to_string();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("usage request");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("read timeout");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).expect("read request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            )
+            .expect("write response");
+            String::from_utf8_lossy(&request).into_owned()
+        });
+        (format!("http://{address}/api/oauth/usage"), handle)
     }
 
     #[test]
@@ -1383,6 +1812,177 @@ mod tests {
         assert!(!serialized.contains("DO-NOT-RETURN"));
         assert!(!serialized.contains("tokenHash"));
         assert!(!serialized.contains("unknownSensitiveField"));
+    }
+
+    #[test]
+    fn parses_only_allowlisted_direct_account_usage_fields() {
+        let observed_at = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let usage = parse_claude_usage_api_response(
+            br#"{
+              "five_hour":{"utilization":12.5,"resets_at":"2027-01-15T09:00:00Z"},
+              "seven_day":{"utilization":44.0,"resets_at":"2027-01-19T12:30:00Z"},
+              "account_email":"private@example.com",
+              "organization":{"name":"Private organization"}
+            }"#,
+            observed_at,
+        )
+        .expect("valid direct usage response");
+
+        assert_eq!(usage.source, "claude-account-api");
+        assert_eq!(usage.status, ClaudeUsageStatus::Available);
+        assert_eq!(usage.session_percent, Some(12.5));
+        assert_eq!(usage.weekly_percent, Some(44.0));
+        assert_eq!(usage.session_reset_at_ms, Some(1_800_003_600_000));
+        assert_eq!(usage.weekly_reset_at_ms, Some(1_800_361_800_000));
+
+        let serialized = serde_json::to_string(&usage).expect("serializable usage");
+        assert!(!serialized.contains("private@example.com"));
+        assert!(!serialized.contains("Private organization"));
+    }
+
+    #[test]
+    fn refuses_an_expired_oauth_access_token_before_network_use() {
+        let fixture = Fixture::new();
+        let credentials_path = fixture.path().join(".credentials.json");
+        fs::write(
+            &credentials_path,
+            r#"{"claudeAiOauth":{"accessToken":"never-return-this","expiresAt":999}}"#,
+        )
+        .expect("credential fixture");
+
+        let result = read_claude_oauth_credentials_from(
+            &credentials_path,
+            UNIX_EPOCH + Duration::from_secs(2),
+        );
+        assert!(matches!(
+            result,
+            Err(ClaudeUsageReason::AuthenticationExpired)
+        ));
+    }
+
+    #[test]
+    fn fetches_direct_usage_with_bearer_auth_and_persists_only_display_fields() {
+        let fixture = Fixture::new();
+        let credentials_path = fixture.path().join(".credentials.json");
+        let snapshot_path = fixture.path().join("usage.json");
+        fs::write(
+            &credentials_path,
+            r#"{"claudeAiOauth":{"accessToken":"test-secret-token","expiresAt":5000}}"#,
+        )
+        .expect("credential fixture");
+        let (endpoint, server) = one_request_server(
+            "200 OK",
+            r#"{"five_hour":{"utilization":7.0},"seven_day":{"utilization":21.0}}"#,
+        );
+        let observed_at = UNIX_EPOCH + Duration::from_secs(2);
+
+        let usage = fetch_claude_usage_from_endpoint(
+            &credentials_path,
+            &snapshot_path,
+            &endpoint,
+            observed_at,
+        );
+        let request = server.join().expect("server result");
+
+        assert_eq!(usage.status, ClaudeUsageStatus::Available);
+        assert_eq!(usage.session_percent, Some(7.0));
+        assert_eq!(usage.weekly_percent, Some(21.0));
+        assert!(
+            request.contains("authorization: Bearer test-secret-token")
+                || request.contains("Authorization: Bearer test-secret-token")
+        );
+        assert!(request.contains("anthropic-beta: oauth-2025-04-20"));
+
+        let cached =
+            read_live_usage_snapshot_from(&snapshot_path, observed_at + Duration::from_secs(10));
+        assert_eq!(cached.source, "claude-account-api");
+        assert_eq!(cached.status, ClaudeUsageStatus::Available);
+        assert_eq!(cached.session_percent, Some(7.0));
+        let stored = fs::read_to_string(snapshot_path).expect("stored snapshot");
+        assert!(!stored.contains("test-secret-token"));
+    }
+
+    #[test]
+    fn maps_direct_usage_unauthorized_to_expired_authentication() {
+        let fixture = Fixture::new();
+        let credentials_path = fixture.path().join(".credentials.json");
+        fs::write(
+            &credentials_path,
+            r#"{"claudeAiOauth":{"accessToken":"test-secret-token","expiresAt":5000}}"#,
+        )
+        .expect("credential fixture");
+        let (endpoint, server) = one_request_server(
+            "401 Unauthorized",
+            r#"{"type":"error","error":{"message":"expired"}}"#,
+        );
+
+        let usage = fetch_claude_usage_from_endpoint(
+            &credentials_path,
+            &fixture.path().join("usage.json"),
+            &endpoint,
+            UNIX_EPOCH + Duration::from_secs(2),
+        );
+        server.join().expect("server result");
+
+        assert_eq!(usage.status, ClaudeUsageStatus::Error);
+        assert_eq!(usage.reason, Some(ClaudeUsageReason::AuthenticationExpired));
+        assert_eq!(usage.session_percent, None);
+    }
+
+    #[test]
+    fn refreshes_directly_when_local_usage_sources_are_not_current() {
+        let fixture = Fixture::new();
+        let snapshot_path = fixture.path().join("relay-usage.json");
+        let fallback_path = fixture.path().join("missing-ccstatusline.json");
+        let credentials_path = fixture.path().join(".credentials.json");
+        fs::write(
+            &credentials_path,
+            r#"{"claudeAiOauth":{"accessToken":"test-secret-token","expiresAt":5000}}"#,
+        )
+        .expect("credential fixture");
+        let (endpoint, server) = one_request_server(
+            "200 OK",
+            r#"{"limits":[{"kind":"session","utilization":9.0},{"kind":"weekly_all","utilization":23.0}]}"#,
+        );
+
+        let usage = read_claude_usage_with_direct_refresh(
+            &snapshot_path,
+            &fallback_path,
+            &credentials_path,
+            &endpoint,
+            UNIX_EPOCH + Duration::from_secs(2),
+        );
+        server.join().expect("server result");
+
+        assert_eq!(usage.source, "claude-account-api");
+        assert_eq!(usage.status, ClaudeUsageStatus::Available);
+        assert_eq!(usage.session_percent, Some(9.0));
+        assert_eq!(usage.weekly_percent, Some(23.0));
+    }
+
+    #[test]
+    fn current_statusline_usage_avoids_direct_credential_access() {
+        let fixture = Fixture::new();
+        let snapshot_path = fixture.path().join("relay-usage.json");
+        let observed_at = UNIX_EPOCH + Duration::from_secs(2);
+        write_claude_usage_snapshot_from_statusline_to(
+            br#"{"rate_limits":{"five_hour":{"used_percentage":3.0}}}"#,
+            &snapshot_path,
+            observed_at,
+        )
+        .expect("statusline snapshot");
+
+        let usage = read_claude_usage_with_direct_refresh(
+            &snapshot_path,
+            &fixture.path().join("missing-ccstatusline.json"),
+            &fixture.path().join("missing-credentials.json"),
+            "http://127.0.0.1:1/should-not-be-called",
+            observed_at + Duration::from_secs(10),
+        );
+
+        assert_eq!(usage.source, "claude-statusline");
+        assert_eq!(usage.status, ClaudeUsageStatus::Available);
+        assert_eq!(usage.session_percent, Some(3.0));
     }
 
     #[test]
@@ -1782,7 +2382,6 @@ mod tests {
     #[test]
     fn terminal_arguments_keep_user_values_out_of_powershell_source() {
         use super::terminal_resume_args;
-        use std::ffi::OsString;
 
         let cwd = Path::new(r"C:\work folder\relay & safe");
         let args = terminal_resume_args(SESSION_ID, cwd);
@@ -1791,5 +2390,14 @@ mod tests {
         assert_eq!(args[7], OsString::from("& claude --resume $args[0]"));
         assert!(!args[7].to_string_lossy().contains(SESSION_ID));
         assert!(!args[7].to_string_lossy().contains("work folder"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn claude_login_uses_a_constant_visible_terminal_command() {
+        let args = claude_login_args();
+        assert_eq!(args[0], OsString::from("new-tab"));
+        assert_eq!(args[1], OsString::from("powershell.exe"));
+        assert_eq!(args[5], OsString::from("& claude auth login"));
     }
 }

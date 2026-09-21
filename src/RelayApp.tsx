@@ -14,6 +14,7 @@ import {
   enableClaudeLiveUsage,
   openClaudeInstallGuide,
   readClaudeUsage,
+  reauthenticateClaude,
   resumeClaudeSession,
   type ClaudeDiscoveryResult,
   type ClaudeUsage,
@@ -224,6 +225,15 @@ export default function RelayApp() {
       setIsEnablingLiveUsage(false);
     }
   }, [refreshUsage]);
+
+  const reauthenticateClaudeUsage = useCallback(async () => {
+    setActionError(null);
+    try {
+      await reauthenticateClaude();
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : String(error));
+    }
+  }, []);
 
   useEffect(() => {
     if (!isOnboarded) return;
@@ -622,6 +632,7 @@ export default function RelayApp() {
             loadError={usageLoadError}
             onEnableLiveUsage={enableLiveUsage}
             isEnablingLiveUsage={isEnablingLiveUsage}
+            onReauthenticateClaude={() => { void reauthenticateClaudeUsage(); }}
           />
         )}
         {activeTab === "Settings" && (
