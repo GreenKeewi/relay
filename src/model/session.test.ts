@@ -131,7 +131,9 @@ describe("timestamp labels", () => {
 
   it("labels review-ready sessions by completion time", () => {
     const review = sessions()[1];
-    expect(formatSessionTime(review, NOW)).toBe("completed 3:18 PM");
+    expect(
+      formatSessionTime(review, NOW, { timeZone: "America/Toronto" }),
+    ).toBe("completed 3:18 PM");
   });
 });
 
