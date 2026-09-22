@@ -28,6 +28,15 @@ relay       3824        52.89     16.74
 
 The `relay.exe` process itself — Rust backend plus window management, excluding the shared system-wide WebView2 renderer host — holds roughly **15-17 MB of private (non-shared) memory** and ~50 MB of working set. WebView2 rendering happens in `msedgewebview2.exe` host processes that are shared across every WebView2-based app running on the machine (not exclusive to Relay), so they're not counted as Relay's own footprint. Run the command above yourself while Relay is open to reproduce this.
 
+Windows Task Manager reports the same app row at **14.8 MB**, 0% CPU, idle:
+
+```
+Apps (1)
+  Relay          0%   14.8 MB   0 MB/s   0 Mbps
+```
+
+Check the "Apps" section of Task Manager yourself while Relay is open to reproduce this.
+
 ## What works
 
 - Discovers real Claude Code sessions from local metadata under `~/.claude/projects`
